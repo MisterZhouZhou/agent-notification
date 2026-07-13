@@ -30,6 +30,15 @@ brew install terminal-notifier
 curl -fsSL https://raw.githubusercontent.com/MisterZhouZhou/agent-notification/main/install.sh | sh
 ```
 
+如果访问 `raw.githubusercontent.com` 时出现证书校验或连接错误，请先配置你的本地代理后再执行安装命令：
+
+```bash
+export https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897
+curl -fsSL https://raw.githubusercontent.com/MisterZhouZhou/agent-notification/main/install.sh | sh
+```
+
+不建议使用 `curl -k` 跳过证书校验；安装脚本会在本机执行，保留 TLS 校验更安全。
+
 默认在线安装会同时配置 Claude Code 和 Codex。只安装其中一个：
 
 ```bash
