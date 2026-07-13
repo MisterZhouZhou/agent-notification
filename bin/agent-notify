@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""Desktop notifications for Claude Code and Codex lifecycle hooks."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+
+SOURCE_LABELS = {
+    "claude": "Claude Code",
+    "codex": "Codex",
+}
+
+TERMINAL_BUNDLE_IDS = {
+    "Apple_Terminal": "com.apple.Terminal",
+    "iTerm.app": "com.googlecode.iterm2",
+    "iTerm2": "com.googlecode.iterm2",
+    "vscode": "com.microsoft.VSCode",
+    "WarpTerminal": "dev.warp.Warp-Stable",
+    "cursor": "com.todesktop.230313mzl4w4u92",
+}
+
+NOTIFICATION_SETTINGS_URL = (
+    "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+)
+
+TERMINAL_NOTIFIER_BUNDLE_ID = "fr.julienxx.oss.terminal-notifier"
+
+PERMISSION_REMINDER_FALLBACK_INTERVAL = 60 * 60
+
+# Private macOS ncprefs bit observed on macOS 15: set when "Allow Notifications" is on.
+NOTIFICATIONS_ENABLED_FLAG = 0x02000000
+
+ICON_FILENAMES = {
+    "claude": "claude.png",
+    "codex": "codex.png",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Send macOS notifications from Claude Code and Codex hooks."
+    )
+    actions = parser.add_subparsers(dest="action", required=True)
+    for source in SOURCE_LABELS:
+        hook_parser = actions.add_parser(source)
+        hook_parser.set_defaults(source=source)
+        hook_parser.add_argument("event", choices=("stop", "permission"))
+    doctor_parser = actions.add_parser("doctor")
+    doctor_parser.add_argument("--open-settings", action="store_true")
+    return parser.parse_args()
+
+
+def read_payload() -> dict[str, Any]:
+    try:
+        value = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def compact_text(value: Any, limit: int = 180) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def project_context(payload: dict[str, Any]) -> tuple[str, str]:
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    cwd = os.path.abspath(os.path.expanduser(cwd))
+    return Path(cwd).name or cwd, cwd
+
+
+def permission_message(payload: dict[str, Any]) -> str:
+    message = compact_text(payload.get("message"))
+    if message:
+        return message
+
+    tool_name = compact_text(payload.get("tool_name"), 60)
+    if tool_name:
+        return f"{tool_name} 正在等待你的确认"
+    return "需要你的确认才能继续"
+
+
+def notification_content(
+    source: str, event: str, payload: dict[str, Any]
+) -> dict[str, str]:
+    source_label = SOURCE_LABELS[source]
+    project_name, cwd = project_context(payload)
+
+    if event == "permission":
+        title = f"{source_label} · 需要授权"
+        message = permission_message(payload)
+        sound = "Submarine"
+    else:
+        title = f"{source_label} · 回复完成"
+        message = compact_text(payload.get("last_assistant_message"))
+        if not message:
+            message = "当前回合已结束"
+        sound = "Glass"
+
+    project_hash = hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:16]
+    group_root = f"agent-notify:{source}:{project_hash}"
+    return {
+        "title": title,
+        "subtitle": project_name,
+        "message": message,
+        "sound": sound,
+        "group": f"{group_root}:{event}",
+        "permission_group": f"{group_root}:permission",
+        "cwd": cwd,
+    }
+
+
+def find_notifier() -> str | None:
+    configured = os.environ.get("AGENT_NOTIFY_BIN")
+    if configured:
+        path = os.path.abspath(os.path.expanduser(configured))
+        return path if os.access(path, os.X_OK) else None
+
+    discovered = shutil.which("terminal-notifier")
+    if discovered:
+        return discovered
+
+    for path in ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"):
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def notifier_app_path(notifier: str) -> Path | None:
+    executable = Path(notifier).expanduser().resolve()
+    for parent in (executable, *executable.parents):
+        if parent.suffix == ".app" and parent.is_dir():
+            return parent
+
+    cellar_app = executable.parent.parent / "terminal-notifier.app"
+    return cellar_app if cellar_app.is_dir() else None
+
+
+def notifier_bundle_id(notifier: str) -> str | None:
+    configured = os.environ.get("AGENT_NOTIFY_BUNDLE_ID")
+    if configured:
+        return configured
+
+    app_path = notifier_app_path(notifier)
+    if app_path:
+        try:
+            with (app_path / "Contents/Info.plist").open("rb") as file:
+                value = plistlib.load(file).get("CFBundleIdentifier")
+            if isinstance(value, str) and value:
+                return value
+        except (OSError, plistlib.InvalidFileException):
+            pass
+
+    if Path(notifier).name == "terminal-notifier":
+        return TERMINAL_NOTIFIER_BUNDLE_ID
+    return None
+
+
+def notification_preference(bundle_id: str) -> dict[str, Any] | None:
+    configured = os.environ.get("AGENT_NOTIFY_PREFS_PATH")
+    path = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / "Library/Preferences/com.apple.ncprefs.plist"
+    )
+    try:
+        with path.open("rb") as file:
+            preferences = plistlib.load(file)
+    except (OSError, plistlib.InvalidFileException):
+        return None
+
+    apps = preferences.get("apps") if isinstance(preferences, dict) else None
+    if not isinstance(apps, list):
+        return None
+    for app in apps:
+        if isinstance(app, dict) and app.get("bundle-id") == bundle_id:
+            return app
+    return None
+
+
+def notification_permission_disabled(notifier: str) -> bool:
+    bundle_id = notifier_bundle_id(notifier)
+    if not bundle_id:
+        return False
+    preference = notification_preference(bundle_id)
+    if preference is None:
+        return False
+    flags = preference.get("flags")
+    return isinstance(flags, int) and not (flags & NOTIFICATIONS_ENABLED_FLAG)
+
+
+def reminder_state_path() -> Path:
+    configured = os.environ.get("AGENT_NOTIFY_STATE_DIR")
+    directory = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / "Library/Caches/agent-notify"
+    )
+    return directory / "permission-reminder.json"
+
+
+def icon_path(source: str) -> Path | None:
+    configured = os.environ.get("AGENT_NOTIFY_ICON")
+    if configured:
+        if configured.startswith("file:"):
+            parsed = urlparse(configured)
+            if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+                return None
+            candidate = Path(unquote(parsed.path))
+        else:
+            candidate = Path(configured).expanduser()
+        return candidate.resolve() if candidate.is_file() else None
+
+    configured_directory = os.environ.get("AGENT_NOTIFY_ICON_DIR")
+    directory = (
+        Path(configured_directory).expanduser()
+        if configured_directory
+        else Path.home() / ".local/share/agent-notify/icons"
+    )
+    candidate = directory / ICON_FILENAMES[source]
+    return candidate.resolve() if candidate.is_file() else None
+
+
+def load_reminder_state(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def should_show_permission_reminder(
+    session_id: str, state: dict[str, Any], now: float | None = None
+) -> bool:
+    if os.environ.get("AGENT_NOTIFY_PERMISSION_REMINDER", "1") == "0":
+        return False
+    current_time = now if now is not None else time.time()
+    sessions = state.get("sessions")
+    if session_id and isinstance(sessions, dict):
+        return session_id not in sessions
+    if session_id:
+        return True
+    last_shown = state.get("last_shown")
+    return not isinstance(last_shown, (int, float)) or (
+        current_time - last_shown >= PERMISSION_REMINDER_FALLBACK_INTERVAL
+    )
+
+
+def show_permission_reminder(source: str, payload: dict[str, Any]) -> None:
+    path = reminder_state_path()
+    raw_session_id = payload.get("session_id") or payload.get("sessionId")
+    session_id = raw_session_id if isinstance(raw_session_id, str) else ""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_reminder_state(path)
+            if not should_show_permission_reminder(session_id, state):
+                return
+
+            now = time.time()
+            sessions = state.get("sessions")
+            if not isinstance(sessions, dict):
+                sessions = {}
+            sessions = {
+                key: timestamp
+                for key, timestamp in sessions.items()
+                if isinstance(key, str)
+                and isinstance(timestamp, (int, float))
+                and now - timestamp < 30 * 24 * 60 * 60
+            }
+            if session_id:
+                sessions[session_id] = now
+            state = {"last_shown": now, "sessions": sessions}
+            path.write_text(
+                json.dumps(state, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            if os.environ.get("AGENT_NOTIFY_DRY_RUN") == "1":
+                return
+
+            reminder_icon = icon_path(source)
+            icon_argument = str(reminder_icon) if reminder_icon else ""
+            script = """
+on run argv
+set iconPath to item 1 of argv
+if iconPath is not "" then
+    set dialogIcon to POSIX file iconPath as alias
+else
+    set dialogIcon to caution
+end if
+set dialogResult to display dialog ¬
+    "terminal-notifier 的通知权限已关闭，Claude Code 和 Codex 的完成及授权提醒不会显示。" ¬
+    with title "agent-notify" ¬
+    buttons {"稍后", "打开设置"} ¬
+    default button "打开设置" ¬
+    with icon dialogIcon ¬
+    giving up after 8
+if gave up of dialogResult then return
+set resultButton to button returned of dialogResult
+if resultButton is "打开设置" then
+    open location "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+end if
+end run
+"""
+            try:
+                subprocess.run(
+                    ["/usr/bin/osascript", "-e", script, icon_argument],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=9,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return
+    except OSError:
+        return
+
+
+def open_notification_settings() -> None:
+    run_quietly(["/usr/bin/open", NOTIFICATION_SETTINGS_URL])
+
+
+def doctor(open_settings: bool) -> int:
+    if sys.platform != "darwin":
+        print("agent-notify 当前只支持 macOS 通知。", file=sys.stderr)
+        return 1
+
+    notifier = find_notifier()
+    if not notifier:
+        print("未找到 terminal-notifier，将使用 osascript 降级通知。", file=sys.stderr)
+        if open_settings:
+            open_notification_settings()
+        return 1
+
+    bundle_id = notifier_bundle_id(notifier)
+    if not bundle_id:
+        print(f"已找到发送器：{notifier}")
+        print("无法识别发送器 bundle ID，请在系统设置的通知列表中人工确认。")
+        if open_settings:
+            open_notification_settings()
+        return 1
+
+    preference = notification_preference(bundle_id)
+    print(f"通知发送器：{notifier}")
+    print(f"Bundle ID：{bundle_id}")
+    if preference is None:
+        print("状态：尚未在 macOS 通知偏好中登记，先发送一次测试通知。")
+        if open_settings:
+            open_notification_settings()
+        return 1
+
+    flags = preference.get("flags")
+    if isinstance(flags, int) and not (flags & NOTIFICATIONS_ENABLED_FLAG):
+        print("状态：通知已在 macOS 系统设置中关闭。", file=sys.stderr)
+        print(
+            "macOS 不会再次弹出授权框；请在“系统设置 → 通知 → terminal-notifier”中打开“允许通知”。",
+            file=sys.stderr,
+        )
+        if open_settings:
+            open_notification_settings()
+        return 2
+
+    if not isinstance(flags, int):
+        print("状态：macOS 未提供可识别的通知开关状态，请人工确认。")
+        if open_settings:
+            open_notification_settings()
+        return 1
+
+    print(f"状态：通知开关已开启（macOS flags=0x{flags:x}）。")
+    print("请发送测试通知做最终可见性确认；terminal-notifier 无法报告横幅是否实际展示。")
+    if open_settings:
+        open_notification_settings()
+    return 0
+
+
+def activation_bundle_id() -> str | None:
+    configured = os.environ.get("AGENT_NOTIFY_ACTIVATE")
+    if configured:
+        return None if configured.lower() == "none" else configured
+    return TERMINAL_BUNDLE_IDS.get(os.environ.get("TERM_PROGRAM", ""))
+
+
+def notifier_command(
+    notifier: str, source: str, content: dict[str, str]
+) -> list[str]:
+    command = [
+        notifier,
+        "-title",
+        content["title"],
+        "-subtitle",
+        content["subtitle"],
+        "-message",
+        content["message"],
+        "-sound",
+        content["sound"],
+        "-group",
+        content["group"],
+    ]
+
+    bundle_id = activation_bundle_id()
+    if bundle_id:
+        command.extend(("-activate", bundle_id))
+
+    notification_icon = icon_path(source)
+    if notification_icon:
+        icon_uri = notification_icon.as_uri()
+        command.extend(("-appIcon", icon_uri, "-contentImage", icon_uri))
+    return command
+
+
+def run_quietly(command: list[str]) -> bool:
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def send_with_osascript(content: dict[str, str]) -> bool:
+    osascript = shutil.which("osascript") or "/usr/bin/osascript"
+    script = """
+on run argv
+    set messageText to item 1 of argv
+    set titleText to item 2 of argv
+    set subtitleText to item 3 of argv
+    set soundName to item 4 of argv
+    display notification messageText with title titleText subtitle subtitleText sound name soundName
+end run
+"""
+    return run_quietly(
+        [
+            osascript,
+            "-e",
+            script,
+            content["message"],
+            content["title"],
+            content["subtitle"],
+            content["sound"],
+        ]
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    if args.action == "doctor":
+        return doctor(args.open_settings)
+
+    payload = read_payload()
+    content = notification_content(args.source, args.event, payload)
+    notifier = find_notifier()
+
+    if notifier and notification_permission_disabled(notifier):
+        show_permission_reminder(args.source, payload)
+        return 0
+
+    command = notifier_command(notifier, args.source, content) if notifier else []
+    if os.environ.get("AGENT_NOTIFY_DRY_RUN") == "1":
+        print(
+            json.dumps(
+                {
+                    **content,
+                    "notifier": notifier,
+                    "command": command,
+                    "remove_group": (
+                        content["permission_group"] if args.event == "stop" else None
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    if notifier:
+        if args.event == "stop":
+            run_quietly([notifier, "-remove", content["permission_group"]])
+        if run_quietly(command):
+            return 0
+
+    send_with_osascript(content)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
