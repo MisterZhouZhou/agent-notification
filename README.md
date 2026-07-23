@@ -21,6 +21,64 @@
 
 ## 使用方式
 
+推荐通过插件系统安装。老的 `install.sh` / `install.py` 直接改 `~/.claude/settings.json` 和 `~/.codex/hooks.json` 的方式仍然保留，适合不使用插件系统的用户。
+
+### 通过插件安装（推荐）
+
+已上架到 [`agent-plugins`](https://github.com/MisterZhouZhou/agent-plugins) 插件市场，Claude Code 和 Codex 各有一个入口。安装、更新、卸载都由插件系统托管，不再需要手动改配置文件。
+
+前置依赖依然是 `terminal-notifier`：
+
+```bash
+brew install terminal-notifier
+```
+
+#### Claude Code 插件安装
+
+在 Claude Code 中：
+
+```
+/plugin marketplace add MisterZhouZhou/agent-plugins
+/plugin install agent-notify@claude-agent-plugins
+```
+
+安装后重开一个会话即可生效。
+
+#### Codex 插件安装
+
+```bash
+codex plugin marketplace add MisterZhouZhou/agent-plugins
+codex plugin add agent-notify@codex-agent-plugins
+```
+
+安装完成后进入 Codex 执行 `/hooks`，审核并信任 `Stop` 与 `PermissionRequest` 两条 Hook，然后新开一个会话。Codex 强制要求 Hook 被 trust 后才会执行。
+
+#### 本地 marketplace 调试
+
+如果需要在本地目录里调试，把上面的 `MisterZhouZhou/agent-plugins` 替换为本地路径，例如：
+
+```
+/plugin marketplace add ~/path/to/agent-plugins
+```
+
+或者跳过 marketplace，Claude Code 直接用 `--plugin-dir` 加载：
+
+```bash
+claude --plugin-dir ~/path/to/agent-plugins/plugins/agent-notify
+```
+
+#### 插件方式和脚本方式的区别
+
+| 维度 | 插件安装 | 脚本安装 |
+|---|---|---|
+| 二进制位置 | `${CLAUDE_PLUGIN_ROOT}/bin/agent-notify`（缓存目录，插件系统管理） | `~/.local/bin/agent-notify` |
+| 图标位置 | `${CLAUDE_PLUGIN_ROOT}/assets/`（随插件分发） | `~/.local/share/agent-notify/icons/` |
+| 配置写入 | 由 Claude Code / Codex 插件系统托管 | 直接写入 `~/.claude/settings.json` 和 `~/.codex/hooks.json` |
+| 卸载 | `/plugin uninstall` 或 `codex plugin remove` | `sh install.sh --uninstall` |
+| 更新 | `/plugin update` 或 `codex plugin update` | 重跑 `install.sh` |
+
+两种方式**不要同时启用**，否则每次事件会重复发送两份通知。切换前用另一方式的卸载命令清理。
+
 ### 在线安装
 
 依赖 Python 3。推荐安装 `terminal-notifier`：
